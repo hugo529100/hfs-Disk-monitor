@@ -1,7 +1,8 @@
 exports.version = 2.1
 exports.apiRequired = 10.0
 exports.description = "NAS-optimized drive monitor. Passive mode subscribes to Windows event log; aggressive mode polls drive letters."
-exports.repo = "Hug3O/Disk-monitor"
+exports.repo = "hugo529100/hfs-Disk-monitor"
+
 
 const { spawn } = require('child_process')
 
