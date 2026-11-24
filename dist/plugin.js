@@ -1,5 +1,5 @@
-exports.version = 2.1
-exports.apiRequired = 10.0
+﻿exports.version = 2.7
+exports.apiRequired = 12.3
 exports.description = "NAS-optimized drive monitor. Passive mode subscribes to Windows event log; aggressive mode polls drive letters."
 exports.repo = "hugo529100/hfs-Disk-monitor"
 
@@ -15,9 +15,10 @@ exports.config = {
         type: 'select',
         label: 'Monitor mode',
         helperText: 'Passive: subscribe to Windows event log (recommended, does not wake HDDs). Aggressive: poll drive letters (may wake HDDs).',
+        // HFS select options are { label: value }: label first, stored value second.
         options: {
-            passive: 'Passive (Event Log)',
-            aggressive: 'Aggressive (Polling)'
+            'Passive (Event Log)': 'passive',
+            'Aggressive (Polling)': 'aggressive'
         },
         defaultValue: 'passive'
     },
@@ -50,6 +51,21 @@ exports.init = api => {
     let timer
     let psProcess = null
     let state = new Map()
+
+    // Older configs stored the option's description ("Passive (Event Log)") instead of
+    // its value, and the old check silently fell through to the polling branch: every
+    // few seconds the plugin probed every configured drive letter, which can wake all
+    // HDDs. Anything that does not say "aggressive" is treated as passive from now on,
+    // and the stored value is migrated once so the admin panel shows the right choice.
+    function normalizeMode(value) {
+        return /aggressive/i.test(String(value ?? '')) ? 'aggressive' : 'passive'
+    }
+
+    try {
+        const stored = api.getConfig('monitorMode')
+        if (stored !== undefined && stored !== normalizeMode(stored))
+            api.setConfig('monitorMode', normalizeMode(stored))
+    } catch (e) { /* ignore */ }
 
     // ---------- Aggressive mode: polling ----------
 
@@ -101,33 +117,59 @@ exports.init = api => {
         return null
     }
 
+    // Windows PowerShell 5.1 has no Register-WinEvent, and an EventLogWatcher handler
+    // runs on a thread whose console output never reaches us. So one long-lived
+    // PowerShell process queries the System log every few seconds instead, and prints
+    // one JSON line per new event. Reading the event log does not touch the drives,
+    // unlike probing drive letters, so this stays safe on a NAS.
+    const PASSIVE_CHECK_SECONDS = 5
+    const PASSIVE_RESTART_MS = 60000
+    let passiveRestartTimer = null
+    let passiveStopped = false
+
     function startPassive() {
 
+        passiveStopped = false
         const ids = new Set([...ERROR_IDS, ...REMOVAL_IDS])
         const idFilter = Array.from(ids).map(i => `EventID=${i}`).join(' or ')
 
         const script = `
-            $ErrorActionPreference = 'SilentlyContinue'
-            $query = @'
-<QueryList>
-  <Query Id="0" Path="System">
-    <Select Path="System">*[System[(${idFilter})]]</Select>
-  </Query>
-</QueryList>
-'@
-            Register-WinEvent -LogName System -FilterXml $query -Action {
-                $e = $EventArgs.Event
-                $out = @{
-                    Id = $e.Id
-                    Source = $e.ProviderName
-                    Level = $e.LevelDisplayName
-                    Time = $e.TimeCreated.ToString('o')
-                    Message = $e.Message
-                } | ConvertTo-Json -Compress
-                [Console]::Out.WriteLine($out)
-                [Console]::Out.Flush()
+            $ErrorActionPreference = 'Stop'
+            # Take over from a listener left behind by a previous plugin instance (HFS can
+            # reload a plugin without unloading it), then keep a single instance alive.
+            $self = $PID
+            Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.ProcessId -ne $self -and $_.CommandLine -and $_.CommandLine.Contains('HFS-DiskMonitor-winevent') } |
+                ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch { } }
+            $mutex = New-Object System.Threading.Mutex($false, 'Local\\HFS-DiskMonitor-winevent')
+            $acquired = $false
+            try { $acquired = $mutex.WaitOne(0) } catch { $acquired = $false }
+            if (-not $acquired) { Write-Output 'already-running'; exit 0 }
+            $xml = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[(${idFilter})]]</Select></Query></QueryList>'
+            $lastId = 0
+            try {
+                $newest = Get-WinEvent -LogName System -MaxEvents 1 -ErrorAction SilentlyContinue
+                if ($newest) { $lastId = [int]$newest.RecordId }
+            } catch { }
+            Write-Output 'watching'
+            while ($true) {
+                $events = @()
+                try { $events = Get-WinEvent -FilterXml $xml -MaxEvents 50 -ErrorAction SilentlyContinue } catch { }
+                foreach ($e in ($events | Sort-Object RecordId)) {
+                    if ($e.RecordId -le $lastId) { continue }
+                    $lastId = $e.RecordId
+                    $payload = @{
+                        Id = $e.Id
+                        Source = $e.ProviderName
+                        Level = $e.LevelDisplayName
+                        Time = $e.TimeCreated.ToString('o')
+                        Message = $e.Message
+                    } | ConvertTo-Json -Compress
+                    [Console]::Out.WriteLine($payload)
+                    [Console]::Out.Flush()
+                }
+                Start-Sleep -Seconds ${PASSIVE_CHECK_SECONDS}
             }
-            while ($true) { Start-Sleep -Seconds 3600 }
         `
 
         psProcess = spawn('powershell.exe',
@@ -171,13 +213,32 @@ exports.init = api => {
                 api.log('[DiskMonitor] PowerShell error:', msg)
         })
 
+        const startedAt = Date.now()
         psProcess.on('close', code => {
-            api.log('[DiskMonitor] Event listener exited with code:', code)
             psProcess = null
+            if (passiveStopped)
+                return
+            if (Date.now() - startedAt < 30000) {
+                // Either another listener already holds the mutex (plugin hot-reloaded
+                // without unloading), or PowerShell refused to start.
+                api.log('[DiskMonitor] Event listener stopped right away with code:', code, '- another listener may already be running')
+                return
+            }
+            api.log('[DiskMonitor] Event listener exited with code:', code, '- restarting in ' + PASSIVE_RESTART_MS / 1000 + 's')
+            passiveRestartTimer = api.setTimeout(() => {
+                passiveRestartTimer = null
+                if (!passiveStopped && !psProcess && api.getConfig('enabled'))
+                    startPassive()
+            }, PASSIVE_RESTART_MS)
         })
     }
 
     function stopPassive() {
+        passiveStopped = true
+        if (passiveRestartTimer) {
+            clearTimeout(passiveRestartTimer)
+            passiveRestartTimer = null
+        }
         if (psProcess) {
             try { psProcess.kill() } catch (e) { /* ignore */ }
             psProcess = null
@@ -192,16 +253,19 @@ exports.init = api => {
             clearInterval(timer)
             timer = null
         }
-        stopPassive()
 
-        if (!api.getConfig('enabled'))
-            return
+        const enabled = api.getConfig('enabled')
+        const mode = normalizeMode(api.getConfig('monitorMode'))
 
-        const mode = api.getConfig('monitorMode') || 'passive'
-
-        if (mode === 'passive') {
+        // The passive listener is long-lived: when start() runs again for an unchanged
+        // configuration (HFS notifies subscribers right away), keep it instead of
+        // killing and respawning PowerShell.
+        if (!enabled || mode !== 'passive')
+            stopPassive()
+        else if (!psProcess)
             startPassive()
-        } else {
+
+        if (enabled && mode === 'aggressive') {
             const interval = api.getConfig('interval') || 2
             timer = api.setInterval(checkDrives, interval * 1000)
         }
@@ -226,3 +290,5 @@ exports.init = api => {
         }
     }
 }
+
+
